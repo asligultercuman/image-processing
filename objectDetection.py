@@ -1,11 +1,16 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
+import utils
 
 # ── 1. Model ve video ─────────────────────────────────────────────────────────
-# model = YOLO('yolov8n.pt')      
+model = YOLO('yolov8n.pt')      
 model2 = YOLO('yolov8n-seg.pt')  # Segmentasyon için ayrı model
 cap   = cv2.VideoCapture('blue-tshirt.mp4')
+
+alt_mavi = np.array([90, 50, 50])
+ust_mavi = np.array([130, 255, 255])
+hedef_hue = 60  # 60 = HSV'de Yeşil tonları
 
 if not cap.isOpened():
     raise FileNotFoundError("Video dosyası açılamadı: blue-tshirt.mp4")
@@ -28,34 +33,6 @@ def sinif_rengi(sinif_id: int) -> tuple:
     ]
     return renkler[sinif_id % len(renkler)]
 
-def rengi_degistir(roi, alt_hsv, ust_hsv, yeni_renk_kodu):
-    """
-    Belirli bir renk aralığını hedef renge dönüştürür.
-    yeni_renk_kodu: HSV uzayındaki yeni 'Hue' (Renk Tonu) değeridir.
-    """
-    # 1. BGR'den HSV'ye geçiş
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    
-    # 2. Renk maskesi oluştur (Gömleğin o anki rengini bul)
-    mask = cv2.inRange(hsv_roi, alt_hsv, ust_hsv)
-    
-    # 3. Maskelenen yerlerin Hue kanalını değiştir
-    # H, S, V kanallarını ayır
-    h, s, v = cv2.split(hsv_roi)
-    
-    # Sadece maskenin 255 (beyaz) olduğu yerlerde H değerini güncelle
-    h[mask > 0] = yeni_renk_kodu
-    
-    # 4. Kanalları birleştir ve BGR'ye dön
-    merged_hsv = cv2.merge([h, s, v])
-    yeni_roi = cv2.cvtColor(merged_hsv, cv2.COLOR_HSV2BGR)
-    
-    return yeni_roi
-
-alt_mavi = np.array([90, 50, 50])
-ust_mavi = np.array([130, 255, 255])
-hedef_hue = 60  # 60 = HSV'de Yeşil tonları
-
 # ── 3. Ana döngü ──────────────────────────────────────────────────────────────
 while True:
     ret, frame = cap.read()
@@ -76,8 +53,12 @@ while True:
         height, width = yeni_h, yeni_w 
     # -------------------------------------------------------
 
+    # --- ÖN İŞLEME ADIMI ---
+    # Karanlık veya sisli videolar için iyileştirme yapıyoruz
+    enhanced_frame = utils.apply_clahe(frame)
+
     # 3a. Tespit — sadece güven skoru >= 0.4 olan kutular
-    results = model2(frame, verbose=False, conf=0.4)[0]
+    results = model2(enhanced_frame, verbose=False, conf=0.4)[0]
 
     # 3b. Tespit edilen her nesneyi işaretle
     for box in results.boxes:
@@ -90,32 +71,32 @@ while True:
         # Sadece 'insan' (class 0) ise işlem yap
         if sinif_id == 0:
             # Kişinin bulunduğu bölgeyi (ROI) al
-            roi = frame[y1:y2, x1:x2]
+            roi = enhanced_frame[y1:y2, x1:x2]
             
             if roi.size > 0:
                 # Rengi değiştir
-                degismis_roi = rengi_degistir(roi, alt_mavi, ust_mavi, hedef_hue)
+                degismis_roi = utils.rengi_degistir(roi, alt_mavi, ust_mavi, hedef_hue)
                 
                 # Değişmiş bölgeyi ana frame'e geri yerleştir
-                frame[y1:y2, x1:x2] = degismis_roi
+                enhanced_frame[y1:y2, x1:x2] = degismis_roi
 
         # Kutu
-        cv2.rectangle(frame, (x1, y1), (x2, y2), renk, 2)
+        cv2.rectangle(enhanced_frame, (x1, y1), (x2, y2), renk, 2)
 
         # Etiket arka planı + metin
         metin     = f"{etiket}  {guven:.0%}"
         (tw, th), _ = cv2.getTextSize(metin, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), renk, -1)
-        cv2.putText(frame, metin, (x1 + 3, y1 - 4),
+        cv2.rectangle(enhanced_frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), renk, -1)
+        cv2.putText(enhanced_frame, metin, (x1 + 3, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
 
     # 3c. Kare bilgisi
     nesne_sayisi = len(results.boxes)
-    cv2.putText(frame, f"Nesne: {nesne_sayisi}  |  ESC: cikis  S: kaydet",
+    cv2.putText(enhanced_frame, f"Nesne: {nesne_sayisi}  |  ESC: cikis  S: kaydet",
                 (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX,
                 0.5, (220, 220, 220), 1, cv2.LINE_AA)
 
-    cv2.imshow("Nesne Tespiti", frame)
+    cv2.imshow("Nesne Tespiti", enhanced_frame)
 
     # 3d. Klavye
     tus = cv2.waitKey(int(1000 / fps)) & 0xFF

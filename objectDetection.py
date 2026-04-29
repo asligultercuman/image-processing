@@ -40,25 +40,21 @@ while True:
         print("Video bitti.")
         break
 
-    # --- Dikey Videolar İçin Otomatik Boyutlandırma ---
-    ekran_max_yukseklik = 800  # Ekranın max yüksekliği
-    h, w = frame.shape[:2]
-
-    if h > ekran_max_yukseklik:
-        oran = ekran_max_yukseklik / h
-        yeni_w = int(w * oran)
-        yeni_h = int(h * oran)
-        frame = cv2.resize(frame, (yeni_w, yeni_h))
-        # Koordinatların kaymaması için güncel yükseklik bilgisini alalım
-        height, width = yeni_h, yeni_w 
-    # -------------------------------------------------------
-
     # --- ÖN İŞLEME ADIMI ---
     # Karanlık veya sisli videolar için iyileştirme yapıyoruz
     enhanced_frame = utils.apply_clahe(frame)
 
+    # Görüntüleme için (writer boyutu bozulmasın diye) ayrı bir kopyayı gerekirse küçült
+    ekran_max_yukseklik = 800  # Ekranın max yüksekliği
+    display_frame = enhanced_frame
+    h, w = display_frame.shape[:2]
+    if h > ekran_max_yukseklik:
+        oran = ekran_max_yukseklik / h
+        display_frame = cv2.resize(display_frame, (int(w * oran), int(h * oran)))
+    dh, dw = display_frame.shape[:2]
+
     # 3a. Tespit — sadece güven skoru >= 0.4 olan kutular
-    results = model2(enhanced_frame, verbose=False, conf=0.4)[0]
+    results = model2(display_frame, verbose=False, conf=0.4)[0]
 
     # 3b. Tespit edilen her nesneyi işaretle
     for box in results.boxes:
@@ -71,32 +67,32 @@ while True:
         # Sadece 'insan' (class 0) ise işlem yap
         if sinif_id == 0:
             # Kişinin bulunduğu bölgeyi (ROI) al
-            roi = enhanced_frame[y1:y2, x1:x2]
+            roi = display_frame[y1:y2, x1:x2]
             
             if roi.size > 0:
                 # Rengi değiştir
                 degismis_roi = utils.rengi_degistir(roi, alt_mavi, ust_mavi, hedef_hue)
                 
                 # Değişmiş bölgeyi ana frame'e geri yerleştir
-                enhanced_frame[y1:y2, x1:x2] = degismis_roi
+                display_frame[y1:y2, x1:x2] = degismis_roi
 
         # Kutu
-        cv2.rectangle(enhanced_frame, (x1, y1), (x2, y2), renk, 2)
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), renk, 2)
 
         # Etiket arka planı + metin
         metin     = f"{etiket}  {guven:.0%}"
         (tw, th), _ = cv2.getTextSize(metin, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(enhanced_frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), renk, -1)
-        cv2.putText(enhanced_frame, metin, (x1 + 3, y1 - 4),
+        cv2.rectangle(display_frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), renk, -1)
+        cv2.putText(display_frame, metin, (x1 + 3, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
 
     # 3c. Kare bilgisi
     nesne_sayisi = len(results.boxes)
-    cv2.putText(enhanced_frame, f"Nesne: {nesne_sayisi}  |  ESC: cikis  S: kaydet",
-                (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX,
+    cv2.putText(display_frame, f"Nesne: {nesne_sayisi}  |  ESC: cikis  S: kaydet",
+                (10, dh - 10), cv2.FONT_HERSHEY_SIMPLEX,
                 0.5, (220, 220, 220), 1, cv2.LINE_AA)
 
-    cv2.imshow("Nesne Tespiti", enhanced_frame)
+    cv2.imshow("Nesne Tespiti", display_frame)
 
     # 3d. Klavye
     tus = cv2.waitKey(int(1000 / fps)) & 0xFF
@@ -104,11 +100,12 @@ while True:
         break
     elif tus == ord('s'):       # S → ekran görüntüsü
         dosya = "tespit_goruntü.png"
-        cv2.imwrite(dosya, frame)
+        cv2.imwrite(dosya, display_frame)
         print(f"Kaydedildi: {dosya}")
 
     # 3e. İşlenmiş kareyi video dosyasına yaz
-    out.write(frame)
+    # Video writer sabit boyut bekler; o yüzden orijinal boyutta "enhanced_frame" yazıyoruz.
+    out.write(enhanced_frame)
 
 # ── 4. Temizlik ───────────────────────────────────────────────────────────────
 cap.release()

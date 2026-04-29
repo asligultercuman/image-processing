@@ -6,7 +6,7 @@ model = YOLO('yolov8n.pt')
 cap   = cv2.VideoCapture('car-video.mp4')
 
 if not cap.isOpened():
-    raise FileNotFoundError("Video dosyası açılamadı: car-video-2.mp4")
+    raise FileNotFoundError("Video dosyası açılamadı: car-video.mp4")
 
 fps    = cap.get(cv2.CAP_PROP_FPS) or 25
 width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -74,8 +74,17 @@ def fare_tikla(event, x, y, flags, param):
         print(f"[TAKİP] ({x},{y}) noktasında tespit edilen nesne yok.")
         return
 
-    # Yeni tracker oluştur ve başlat
-    tracker = cv2.TrackerCSRT_create()
+    # Yeni tracker oluştur ve başlat (OpenCV build'ine göre CSRT olmayabilir)
+    tracker_factory = getattr(cv2, "TrackerCSRT_create", None)
+    if tracker_factory is None:
+        tracker_factory = getattr(cv2, "TrackerKCF_create", None)
+    if tracker_factory is None:
+        tracker_factory = getattr(cv2, "TrackerMOSSE_create", None)
+    if tracker_factory is None:
+        print("[TAKİP] Tracker bulunamadı. Çözüm: `opencv-contrib-python` kurun.")
+        return
+
+    tracker = tracker_factory()
     tracker.init(son_frame, bbox)
     takip_bbox  = bbox
     takip_aktif = True

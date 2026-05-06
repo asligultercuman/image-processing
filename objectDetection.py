@@ -1,116 +1,121 @@
-from ultralytics import YOLO
-import cv2
+"""
+detector.py — Nesne tespiti modülü
+agent.py bu sınıfı import ederek kullanır.
+Doğrudan çalıştırılabilir: python detector.py video.mp4
+"""
+import sys
 import numpy as np
+import cv2
+from ultralytics import YOLO
 import utils
 
-# ── 1. Model ve video ─────────────────────────────────────────────────────────
-model = YOLO('yolov8n.pt')      
-model2 = YOLO('yolov8n-seg.pt')  # Segmentasyon için ayrı model
-cap   = cv2.VideoCapture('blue-tshirt.mp4')
 
-alt_mavi = np.array([90, 50, 50])
-ust_mavi = np.array([130, 255, 255])
-hedef_hue = 60  # 60 = HSV'de Yeşil tonları
+class ObjectDetector:
+    """
+    YOLOv8 tabanlı nesne tespiti ve renk değiştirme.
 
-if not cap.isOpened():
-    raise FileNotFoundError("Video dosyası açılamadı: blue-tshirt.mp4")
+    Kullanım:
+        detector = ObjectDetector("yolov8n-seg.pt")
+        boxes = detector.detect(frame)          # → list[dict]
+        frame = detector.draw(frame, boxes)     # kutular çizilir
+    """
 
-fps    = cap.get(cv2.CAP_PROP_FPS) or 25
-width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-print(f"Video: {width}x{height} @ {fps:.1f} fps")
+    # Mavi gömlek → yeşile dönüştürme varsayılan değerleri
+    _ALT_MAVI = np.array([90,  50,  50])
+    _UST_MAVI = np.array([130, 255, 255])
+    _HEDEF_HUE = 60   # HSV'de yeşil
 
-output_path = 'islenmis_video.mp4'
-fourcc = cv2.VideoWriter_fourcc(*'mp4v') # MP4 formatı için kodek
-out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    def __init__(self, model_path="yolov8n-seg.pt", conf=0.4,
+                renk_komutu: dict | None = None, renk_degistir=False):
+        """
+        renk_komutu = {
+            "hedef_sinif": "car",      # hangi YOLO sınıfına uygulanacak (None = hepsi)
+            "kaynak_renk": "blue",     # değiştirilecek renk
+            "hedef_renk":  "green",    # yeni renk
+        }
+        """
+        self.model = YOLO(model_path)
+        self.conf  = conf
+        self.renk_komutu: dict | None = renk_komutu
+        self.renk_degistir = renk_degistir
+        # ── Ana metodlar ──────────────────────────────────────────────────────────
 
-# ── 2. Renk paleti (sınıf ID'sine göre otomatik renk) ────────────────────────
-def sinif_rengi(sinif_id: int) -> tuple:
-    """Her sınıfa tutarlı bir BGR rengi atar."""
-    renkler = [
-        (0, 255, 0),    (0, 200, 255),  (255, 100, 0),
-        (255, 0, 200),  (0, 100, 255),  (180, 255, 0),
-    ]
-    return renkler[sinif_id % len(renkler)]
+    def detect(self, frame: np.ndarray) -> list[dict]:
+        """
+        frame üzerinde YOLO çıkarımı yapar.
+        Döndürür: [{"x1","y1","x2","y2","sinif_id","etiket","guven"}, ...]
+        """
+        results = self.model(frame, verbose=False, conf=self.conf)[0]
+        boxes = []
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            sinif_id = int(box.cls[0])
+            boxes.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "sinif_id": sinif_id,
+                "etiket": results.names[sinif_id],
+                "guven": float(box.conf[0]),
+            })
+        return boxes
 
-# ── 3. Ana döngü ──────────────────────────────────────────────────────────────
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Video bitti.")
-        break
+    def draw(self, frame, boxes, hedef_sinif=None):
+        for b in boxes:
+            if hedef_sinif and b["etiket"] != hedef_sinif:
+                continue
 
-    # --- Dikey Videolar İçin Otomatik Boyutlandırma ---
-    ekran_max_yukseklik = 800  # Ekranın max yüksekliği
-    h, w = frame.shape[:2]
+            # Dinamik renk değiştirme
+            if self.renk_komutu:
+                rk = self.renk_komutu
+                sinif_esle = (rk.get("hedef_sinif") is None or
+                            rk["hedef_sinif"] == b["etiket"])
+                if sinif_esle:
+                    roi = frame[b["y1"]:b["y2"], b["x1"]:b["x2"]]
+                    if roi.size > 0:
+                        frame[b["y1"]:b["y2"], b["x1"]:b["x2"]] = utils.rengi_degistir(
+                            roi,
+                            rk["kaynak_renk"],
+                            rk["hedef_renk"],
+                        )
 
-    if h > ekran_max_yukseklik:
-        oran = ekran_max_yukseklik / h
-        yeni_w = int(w * oran)
-        yeni_h = int(h * oran)
-        frame = cv2.resize(frame, (yeni_w, yeni_h))
-        # Koordinatların kaymaması için güncel yükseklik bilgisini alalım
-        height, width = yeni_h, yeni_w 
-    # -------------------------------------------------------
+            utils.kutu_ve_etiket_ciz(
+                frame, b["x1"], b["y1"], b["x2"], b["y2"],
+                f"{b['etiket']}  {b['guven']:.0%}",
+                utils.sinif_rengi(b["sinif_id"]),
+            )
+        return frame
 
-    # --- ÖN İŞLEME ADIMI ---
-    # Karanlık veya sisli videolar için iyileştirme yapıyoruz
-    enhanced_frame = utils.apply_clahe(frame)
+"""
+# ── Bağımsız çalıştırma (demo) ────────────────────────────────────────────────
 
-    # 3a. Tespit — sadece güven skoru >= 0.4 olan kutular
-    results = model2(enhanced_frame, verbose=False, conf=0.4)[0]
+def _demo(video_path: str):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Video açılamadı: {video_path}")
 
-    # 3b. Tespit edilen her nesneyi işaretle
-    for box in results.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        sinif_id        = int(box.cls[0])
-        etiket          = results.names[sinif_id]
-        guven           = float(box.conf[0])
-        renk            = sinif_rengi(sinif_id)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    detector = ObjectDetector(renk_degistir=True)
 
-        # Sadece 'insan' (class 0) ise işlem yap
-        if sinif_id == 0:
-            # Kişinin bulunduğu bölgeyi (ROI) al
-            roi = enhanced_frame[y1:y2, x1:x2]
-            
-            if roi.size > 0:
-                # Rengi değiştir
-                degismis_roi = utils.rengi_degistir(roi, alt_mavi, ust_mavi, hedef_hue)
-                
-                # Değişmiş bölgeyi ana frame'e geri yerleştir
-                enhanced_frame[y1:y2, x1:x2] = degismis_roi
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = utils.frame_yeniden_boyutlandir(frame)
+        frame = utils.apply_clahe(frame)
+        boxes = detector.detect(frame)
+        frame = detector.draw(frame, boxes)
 
-        # Kutu
-        cv2.rectangle(enhanced_frame, (x1, y1), (x2, y2), renk, 2)
+        h = frame.shape[0]
+        cv2.putText(frame, f"Nesne: {len(boxes)}  |  ESC cikis",
+                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.imshow("Nesne Tespiti", frame)
+        if cv2.waitKey(int(1000 / fps)) & 0xFF == 27:
+            break
 
-        # Etiket arka planı + metin
-        metin     = f"{etiket}  {guven:.0%}"
-        (tw, th), _ = cv2.getTextSize(metin, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(enhanced_frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), renk, -1)
-        cv2.putText(enhanced_frame, metin, (x1 + 3, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+    cap.release()
+    cv2.destroyAllWindows()
 
-    # 3c. Kare bilgisi
-    nesne_sayisi = len(results.boxes)
-    cv2.putText(enhanced_frame, f"Nesne: {nesne_sayisi}  |  ESC: cikis  S: kaydet",
-                (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (220, 220, 220), 1, cv2.LINE_AA)
 
-    cv2.imshow("Nesne Tespiti", enhanced_frame)
-
-    # 3d. Klavye
-    tus = cv2.waitKey(int(1000 / fps)) & 0xFF
-    if tus == 27:               # ESC → çıkış
-        break
-    elif tus == ord('s'):       # S → ekran görüntüsü
-        dosya = "tespit_goruntü.png"
-        cv2.imwrite(dosya, frame)
-        print(f"Kaydedildi: {dosya}")
-
-    # 3e. İşlenmiş kareyi video dosyasına yaz
-    out.write(frame)
-
-# ── 4. Temizlik ───────────────────────────────────────────────────────────────
-cap.release()
-out.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    _demo(sys.argv[1] if len(sys.argv) > 1 else "blue-tshirt.mp4")
+"""

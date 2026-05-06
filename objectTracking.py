@@ -1,157 +1,168 @@
-from ultralytics import YOLO
+"""
+tracker.py — Nesne takibi modülü
+agent.py bu sınıfı import ederek kullanır.
+Doğrudan çalıştırılabilir: python tracker.py video.mp4
+"""
+import sys
 import cv2
-
-# ── 1. Model ve video ─────────────────────────────────────────────────────────
-model = YOLO('yolov8n.pt')
-cap   = cv2.VideoCapture('car-video.mp4')
-
-if not cap.isOpened():
-    raise FileNotFoundError("Video dosyası açılamadı: car-video-2.mp4")
-
-fps    = cap.get(cv2.CAP_PROP_FPS) or 25
-width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-print(f"Video: {width}x{height} @ {fps:.1f} fps")
-print("Kullanım: Takip etmek istediğiniz nesneye FARE ile tıklayın.")
-
-# ── 2. Yardımcı fonksiyonlar ──────────────────────────────────────────────────
-def sinif_rengi(sinif_id: int) -> tuple:
-    renkler = [
-        (0, 255, 0),   (0, 200, 255), (255, 100, 0),
-        (255, 0, 200), (0, 100, 255), (180, 255, 0),
-    ]
-    return renkler[sinif_id % len(renkler)]
+import numpy as np
+import utils
 
 
-def frame_yeniden_boyutlandir(frame, maks_yukseklik=800):
-    h, w = frame.shape[:2]
-    if h > maks_yukseklik:
-        oran = maks_yukseklik / h
-        frame = cv2.resize(frame, (int(w * oran), int(h * oran)))
-    return frame
+def _tracker_olustur():
+    """OpenCV kurulumuna göre en iyi tracker'ı döndürür."""
+    for nesne, kaynak in [
+        ("TrackerCSRT_create",  cv2),
+        ("TrackerKCF_create",   cv2),
+        ("TrackerMOSSE_create", cv2),
+        ("TrackerCSRT_create",  getattr(cv2, "legacy", None)),
+        ("TrackerKCF_create",   getattr(cv2, "legacy", None)),
+    ]:
+        if kaynak is None:
+            continue
+        factory = getattr(kaynak, nesne, None)
+        if factory:
+            return factory()
+    return None
 
 
-def yolo_ile_nesne_bul(frame, tiklanan_nokta, results):
+class ObjectTracker:
     """
-    Kullanıcının tıkladığı noktanın içinde kalan YOLO kutusunu döndürür.
-    Birden fazla kutu çakışıyorsa en küçük alanı olanı seçer (en spesifik nesne).
+    Tek nesne CSRT/KCF takibi.
+
+    Kullanım:
+        tracker = ObjectTracker()
+        tracker.init(frame, bbox)          # bbox = (x, y, w, h)
+        ok, new_bbox = tracker.update(frame)
+        tracker.reset()
     """
-    px, py = tiklanan_nokta
-    adaylar = []
 
-    for box in results.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        if x1 <= px <= x2 and y1 <= py <= y2:
-            alan = (x2 - x1) * (y2 - y1)
-            adaylar.append((alan, (x1, y1, x2 - x1, y2 - y1)))
+    def __init__(self):
+        self._tracker = None
+        self.aktif = False
+        self.son_bbox: tuple | None = None
 
-    if not adaylar:
-        return None
-    adaylar.sort(key=lambda a: a[0])   # en küçük alan → en spesifik
-    return adaylar[0][1]               # (x, y, w, h)
+    # ── Public API ────────────────────────────────────────────────────────────
 
+    def init(self, frame: np.ndarray, bbox: tuple) -> bool:
+        """Tracker'ı başlatır. Başarılıysa True döner."""
+        t = _tracker_olustur()
+        if t is None:
+            print("[TRACKER] Tracker bulunamadı. `opencv-contrib-python` kurun.")
+            return False
+        t.init(frame, bbox)
+        self._tracker = t
+        self.son_bbox = bbox
+        self.aktif = True
+        print(f"[TRACKER] Başlatıldı → bbox: {bbox}")
+        return True
 
-# ── 3. Durum değişkenleri ─────────────────────────────────────────────────────
-tracker        = None     # aktif CSRT tracker nesnesi
-takip_bbox     = None     # son bilinen konum (x, y, w, h)
-takip_aktif    = False
-son_results    = None     # fare tıklamasında kullanmak için son YOLO sonucu
-son_frame      = None     # fare callback'inde erişmek için
-
-
-# ── 4. Fare callback ──────────────────────────────────────────────────────────
-def fare_tikla(event, x, y, flags, param):
-    global tracker, takip_bbox, takip_aktif
-
-    if event != cv2.EVENT_LBUTTONDOWN:
-        return
-    if son_results is None or son_frame is None:
-        return
-
-    bbox = yolo_ile_nesne_bul(son_frame, (x, y), son_results)
-
-    if bbox is None:
-        print(f"[TAKİP] ({x},{y}) noktasında tespit edilen nesne yok.")
-        return
-
-    # Yeni tracker oluştur ve başlat
-    tracker = cv2.TrackerCSRT_create()
-    tracker.init(son_frame, bbox)
-    takip_bbox  = bbox
-    takip_aktif = True
-    print(f"[TAKİP] Başlatıldı → bbox: {bbox}")
-
-
-cv2.namedWindow("Nesne Takibi")
-cv2.setMouseCallback("Nesne Takibi", fare_tikla)
-
-
-# ── 5. Ana döngü ──────────────────────────────────────────────────────────────
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Video bitti.")
-        break
-
-    frame = frame_yeniden_boyutlandir(frame)
-    h, w  = frame.shape[:2]
-
-    # 5a. YOLO tespiti — her karede çalışır (takipte de arka planda aktif)
-    results    = model(frame, verbose=False, conf=0.4)[0]
-    son_results = results
-    son_frame   = frame.copy()
-
-    # 5b. Tüm tespit kutularını soluk çiz (arka plan bilgisi)
-    for box in results.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        sinif_id = int(box.cls[0])
-        renk     = sinif_rengi(sinif_id)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), renk, 1)
-
-    # 5c. Takip aktifse tracker'ı güncelle
-    if takip_aktif and tracker is not None:
-        ok, bbox = tracker.update(frame)
-
+    def update(self, frame: np.ndarray) -> tuple[bool, tuple | None]:
+        """Bir kare ilerletir. (ok, bbox) döner; bbox = (x, y, w, h)."""
+        if not self.aktif or self._tracker is None:
+            return False, None
+        ok, bbox = self._tracker.update(frame)
         if ok:
-            tx, ty, tw, th_box = map(int, bbox)
-            takip_bbox = (tx, ty, tw, th_box)
-
-            # Kalın turuncu kutu — takip edilen nesne
-            cv2.rectangle(frame, (tx, ty), (tx + tw, ty + th_box), (0, 140, 255), 3)
-
-            # Merkez nokta
-            cx, cy = tx + tw // 2, ty + th_box // 2
-            cv2.circle(frame, (cx, cy), 5, (0, 140, 255), -1)
-
-            # Etiket
-            cv2.putText(frame, "Takip ediliyor", (tx, ty - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2, cv2.LINE_AA)
+            self.son_bbox = tuple(map(int, bbox))
         else:
-            takip_aktif = False
-            tracker     = None
-            cv2.putText(frame, "Takip kayboldu — nesneye tekrar tiklayin",
-                        (10, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (0, 0, 220), 2, cv2.LINE_AA)
+            self.aktif = False
+            self._tracker = None
+        return ok, self.son_bbox
 
-    # 5d. Durum bilgisi
-    durum = "Takip: AKTIF" if takip_aktif else "Takip: PASIF — nesneye tiklayin"
-    cv2.putText(frame, f"{durum}  |  Nesne: {len(results.boxes)}  |  ESC: cikis",
-                (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    def reset(self):
+        self._tracker = None
+        self.aktif = False
+        self.son_bbox = None
+        print("[TRACKER] Sıfırlandı.")
 
-    cv2.imshow("Nesne Takibi", frame)
+    def draw(self, frame: np.ndarray) -> np.ndarray:
+        """Aktif takip kutusunu frame üzerine çizer."""
+        if not self.aktif or self.son_bbox is None:
+            return frame
+        x, y, w, h = self.son_bbox
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 140, 255), 3)
+        cv2.circle(frame, (x + w // 2, y + h // 2), 5, (0, 140, 255), -1)
+        cv2.putText(frame, "Takip ediliyor", (x, max(22, y - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2, cv2.LINE_AA)
+        return frame
 
-    tus = cv2.waitKey(int(1000 / fps)) & 0xFF
-    if tus == 27:              # ESC
-        break
-    elif tus == ord('r'):      # R → takibi sıfırla
-        tracker     = None
-        takip_aktif = False
-        print("[TAKİP] Sıfırlandı.")
-    elif tus == ord('s'):      # S → ekran görüntüsü
-        cv2.imwrite("takip_goruntu.png", frame)
-        print("Kaydedildi: takip_goruntu.png")
+    # ── Yardımcı ──────────────────────────────────────────────────────────────
 
-# ── 6. Temizlik ───────────────────────────────────────────────────────────────
-cap.release()
-cv2.destroyAllWindows()
+    @staticmethod
+    def nokta_icindeki_bbox(nokta: tuple, boxes: list[dict]) -> tuple | None:
+        """
+        Tıklanan noktayı kapsayan en küçük bbox'ı döndürür.
+        boxes: detector.detect() çıktısı formatında olmalı.
+        """
+        px, py = nokta
+        adaylar = []
+        for b in boxes:
+            if b["x1"] <= px <= b["x2"] and b["y1"] <= py <= b["y2"]:
+                alan = (b["x2"] - b["x1"]) * (b["y2"] - b["y1"])
+                adaylar.append((alan, (b["x1"], b["y1"],
+                                       b["x2"] - b["x1"], b["y2"] - b["y1"])))
+        if not adaylar:
+            return None
+        adaylar.sort(key=lambda a: a[0])
+        return adaylar[0][1]
+
+
+# ── Bağımsız çalıştırma (demo) ────────────────────────────────────────────────
+
+def _demo(video_path: str):
+    from objectDetection import ObjectDetector
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Video açılamadı: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    detector = ObjectDetector()
+    tracker  = ObjectTracker()
+    son_boxes: list[dict] = []
+    son_frame = None
+
+    def fare_tikla(event, x, y, flags, param):
+        nonlocal son_frame
+        if event != cv2.EVENT_LBUTTONDOWN or son_frame is None:
+            return
+        bbox = ObjectTracker.nokta_icindeki_bbox((x, y), son_boxes)
+        if bbox:
+            tracker.init(son_frame, bbox)
+        else:
+            print(f"[TAKİP] ({x},{y}) noktasında nesne yok.")
+
+    cv2.namedWindow("Nesne Takibi")
+    cv2.setMouseCallback("Nesne Takibi", fare_tikla)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = utils.frame_yeniden_boyutlandir(frame)
+        son_frame = frame.copy()
+        son_boxes = detector.detect(frame)
+        detector.draw(frame, son_boxes)
+        ok, _ = tracker.update(frame)
+        if not ok and tracker.son_bbox is not None:
+            cv2.putText(frame, "Takip kayboldu — nesneye tiklayin",
+                        (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 220), 2)
+        tracker.draw(frame)
+
+        h = frame.shape[0]
+        cv2.putText(frame, "Tiklayarak takip et  |  R: sifirla  |  ESC: cikis",
+                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.imshow("Nesne Takibi", frame)
+
+        tus = cv2.waitKey(int(1000 / fps)) & 0xFF
+        if tus == 27:
+            break
+        elif tus == ord("r"):
+            tracker.reset()
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    _demo(sys.argv[1] if len(sys.argv) > 1 else "car-video.mp4")
